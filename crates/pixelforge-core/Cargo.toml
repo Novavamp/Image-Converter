@@ -1,0 +1,17 @@
+[package]
+name = "pixelforge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+image.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+webp = "0.3.1"
+
+[dev-dependencies]
+crc32fast = "1.5"
+

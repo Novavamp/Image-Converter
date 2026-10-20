@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PixelForge
+Comment=Offline image conversion and optimization
+Exec=pixelforge-desktop
+Icon=pixelforge
+Terminal=false
+Categories=Graphics;Utility;
+MimeType=image/png;image/jpeg;image/webp;image/avif;image/gif;image/tiff;
+

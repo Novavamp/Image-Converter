@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pixelforge-core",
+    "crates/pixelforge-jobs",
+    "crates/pixelforge-desktop",
+    "crates/pixelforge-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["PixelForge contributors"]
+rust-version = "1.95"
+
+[workspace.dependencies]
+image = { version = "0.25.10", default-features = false, features = ["avif", "avif-native", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+
