@@ -355,6 +355,10 @@ pub struct ConversionOptions {
     pub webp_lossless: bool,
     /// Remove recognized metadata chunks from the encoded output.
     pub strip_metadata: bool,
+    /// Text appended to the output file name before its extension.
+    pub output_suffix: String,
+    /// Leave an existing target untouched instead of choosing a numbered name.
+    pub skip_existing: bool,
 }
 
 impl Default for ConversionOptions {
@@ -365,6 +369,8 @@ impl Default for ConversionOptions {
             jpeg_background: [255, 255, 255],
             webp_lossless: false,
             strip_metadata: true,
+            output_suffix: String::new(),
+            skip_existing: false,
         }
     }
 }
@@ -416,6 +422,8 @@ pub enum ConversionError {
     Cancelled,
     #[error("privacy cleanup failed: {0}")]
     PrivacyCleanup(String),
+    #[error("output already exists: {0}")]
+    OutputExists(PathBuf),
 }
 
 pub fn inspect(path: impl AsRef<Path>) -> Result<ImageInfo, ConversionError> {
@@ -502,9 +510,30 @@ pub fn convert_file(
         }
     }
     fs::create_dir_all(output_dir)?;
-    let base = input.file_stem().unwrap_or_default();
-    let proposed = output_dir.join(base).with_extension(format.extension());
-    let output = unique_path(&proposed, input)?;
+    let base = input.file_stem().unwrap_or_default().to_string_lossy();
+    let suffix: String = options
+        .output_suffix
+        .chars()
+        .map(|character| {
+            if matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            ) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let proposed = output_dir.join(format!("{base}{suffix}.{}", format.extension()));
+    let output = if options.skip_existing {
+        if proposed.exists() {
+            return Err(ConversionError::OutputExists(proposed));
+        }
+        proposed
+    } else {
+        unique_path(&proposed, input)?
+    };
     let (temp_path, mut writer) = create_temp(&output)?;
     let publish = encode(&decoded, format, options, &mut writer).and_then(|()| {
         let file = writer
@@ -515,7 +544,18 @@ pub fn convert_file(
         if options.strip_metadata {
             sanitize_output_metadata(&temp_path, format)?;
         }
-        fs::rename(&temp_path, &output)?;
+        if options.skip_existing {
+            fs::hard_link(&temp_path, &output).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    ConversionError::OutputExists(output.clone())
+                } else {
+                    ConversionError::Open(error)
+                }
+            })?;
+            let _ = fs::remove_file(&temp_path);
+        } else {
+            fs::rename(&temp_path, &output)?;
+        }
         Ok(())
     });
     if let Err(error) = publish {
@@ -555,6 +595,41 @@ pub fn fit_dimensions(width: u32, height: u32, bounds: ResizeBounds) -> (u32, u3
         (width as f64 * ratio).round().max(1.0) as u32,
         (height as f64 * ratio).round().max(1.0) as u32,
     )
+}
+
+/// Produces a quick, approximate size estimate by encoding a reduced sample with the same
+/// format and options, then scaling that size to the final pixel area.
+pub fn estimate_output_size(
+    image: &DynamicImage,
+    format: OutputFormat,
+    options: &ConversionOptions,
+) -> Result<(u64, u32, u32), ConversionError> {
+    let mut resized = image.clone();
+    if let Some(bounds) = options.resize {
+        if bounds.width == 0 || bounds.height == 0 {
+            return Err(ConversionError::UnsupportedOutput(
+                "resize dimensions must be positive",
+            ));
+        }
+        let (width, height) = fit_dimensions(resized.width(), resized.height(), bounds);
+        if (width, height) != (resized.width(), resized.height()) {
+            resized = resized.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
+        }
+    }
+    let (width, height) = (resized.width(), resized.height());
+    let sample = resized.thumbnail(320, 320);
+    let sample_pixels = u64::from(sample.width()) * u64::from(sample.height());
+    let final_pixels = u64::from(width) * u64::from(height);
+    if sample_pixels == 0 || final_pixels == 0 {
+        return Err(ConversionError::UnknownFormat);
+    }
+    let mut sample_output = std::io::Cursor::new(Vec::new());
+    encode(&sample, format, options, &mut sample_output)?;
+    let sample_bytes = sample_output.get_ref().len() as u64;
+    let estimated_bytes = sample_bytes
+        .saturating_mul(final_pixels)
+        .div_ceil(sample_pixels);
+    Ok((estimated_bytes.max(1), width, height))
 }
 
 fn unique_path(proposed: &Path, input: &Path) -> Result<PathBuf, std::io::Error> {

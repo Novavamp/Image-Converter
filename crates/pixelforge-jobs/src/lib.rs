@@ -1,8 +1,11 @@
 //! Bounded background conversion worker shared by the desktop UI.
 
-use pixelforge_core::{ConversionOptions, ConversionReport, OutputFormat, convert_file};
+use pixelforge_core::{
+    ConversionError, ConversionOptions, ConversionReport, OutputFormat, convert_file,
+};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -40,6 +43,14 @@ pub struct BatchRequest {
     pub output_dir: PathBuf,
     pub formats: Vec<OutputFormat>,
     pub options: ConversionOptions,
+    pub per_input: HashMap<PathBuf, InputOverrides>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InputOverrides {
+    pub output_dir: Option<PathBuf>,
+    pub formats: Option<Vec<OutputFormat>>,
+    pub options: Option<ConversionOptions>,
 }
 
 #[derive(Debug)]
@@ -57,12 +68,14 @@ pub enum WorkerEvent {
         input: PathBuf,
         format: OutputFormat,
         result: Result<ConversionReport, String>,
+        skipped: bool,
         completed: usize,
         total: usize,
     },
     BatchFinished {
         succeeded: usize,
         failed: usize,
+        skipped: usize,
         cancelled: bool,
     },
 }
@@ -101,13 +114,35 @@ impl Worker {
             .name("pixelforge-converter".into())
             .spawn(move || {
                 while let Ok(Message::Run(batch)) = requests.recv() {
-                    let total = batch.inputs.len().saturating_mul(batch.formats.len());
+                    let total = batch
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            batch
+                                .per_input
+                                .get(input)
+                                .and_then(|override_| override_.formats.as_ref())
+                                .unwrap_or(&batch.formats)
+                                .len()
+                        })
+                        .sum();
                     let _ = event_tx.send(WorkerEvent::BatchStarted { total });
                     let mut completed = 0;
                     let mut succeeded = 0;
                     let mut failed = 0;
+                    let mut skipped = 0;
                     'batch: for input in &batch.inputs {
-                        for format in &batch.formats {
+                        let input_override = batch.per_input.get(input);
+                        let formats = input_override
+                            .and_then(|override_| override_.formats.as_ref())
+                            .unwrap_or(&batch.formats);
+                        let output_dir = input_override
+                            .and_then(|override_| override_.output_dir.as_ref())
+                            .unwrap_or(&batch.output_dir);
+                        let options = input_override
+                            .and_then(|override_| override_.options.as_ref())
+                            .unwrap_or(&batch.options);
+                        for format in formats {
                             while worker_paused.load(Ordering::Acquire)
                                 && !worker_cancelled.load(Ordering::Acquire)
                             {
@@ -122,19 +157,23 @@ impl Worker {
                                 completed,
                                 total,
                             });
-                            let result =
-                                convert_file(input, &batch.output_dir, *format, &batch.options)
-                                    .map_err(|error| error.to_string());
-                            if result.is_ok() {
+                            let conversion = convert_file(input, output_dir, *format, options);
+                            let was_skipped =
+                                matches!(&conversion, Err(ConversionError::OutputExists(_)));
+                            if was_skipped {
+                                skipped += 1;
+                            } else if conversion.is_ok() {
                                 succeeded += 1;
                             } else {
                                 failed += 1;
                             }
+                            let result = conversion.map_err(|error| error.to_string());
                             completed += 1;
                             let _ = event_tx.send(WorkerEvent::ItemFinished {
                                 input: input.clone(),
                                 format: *format,
                                 result,
+                                skipped: was_skipped,
                                 completed,
                                 total,
                             });
@@ -145,6 +184,7 @@ impl Worker {
                     let _ = event_tx.send(WorkerEvent::BatchFinished {
                         succeeded,
                         failed,
+                        skipped,
                         cancelled: was_cancelled,
                     });
                 }
@@ -159,7 +199,16 @@ impl Worker {
     }
 
     pub fn submit(&self, batch: BatchRequest) -> Result<(), SubmitError> {
-        if batch.inputs.is_empty() || batch.formats.is_empty() {
+        if batch.inputs.is_empty()
+            || batch.inputs.iter().any(|input| {
+                batch
+                    .per_input
+                    .get(input)
+                    .and_then(|override_| override_.formats.as_ref())
+                    .unwrap_or(&batch.formats)
+                    .is_empty()
+            })
+        {
             return Err(SubmitError::Empty);
         }
         self.cancelled.store(false, Ordering::Release);
@@ -224,6 +273,7 @@ mod tests {
             output_dir: PathBuf::new(),
             formats: vec![OutputFormat::Png],
             options: ConversionOptions::default(),
+            per_input: HashMap::new(),
         };
         assert!(matches!(worker.submit(batch), Err(SubmitError::Empty)));
     }
@@ -253,6 +303,7 @@ mod tests {
                 output_dir: root.join("out"),
                 formats: vec![OutputFormat::Png, OutputFormat::Webp],
                 options: ConversionOptions::default(),
+                per_input: HashMap::new(),
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -263,6 +314,7 @@ mod tests {
                     succeeded,
                     failed,
                     cancelled,
+                    ..
                 }) => {
                     summary = Some((succeeded, failed, cancelled));
                     break;
